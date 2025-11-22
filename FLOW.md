@@ -52,25 +52,23 @@ This flow shows how a user's claim verification request travels through the syst
 flowchart LR
     A[User Input<br/>Streamlit UI] --> B[app.py<br/>verify_claim]
     B --> C[FactCheckPipeline<br/>verify_claim]
-    C --> D{Is Claim Vague?}
-    D -->|Yes| E[Return Unverifiable]
-    D -->|No| F[Retriever<br/>search_and_rerank]
-    F --> G[Embedder<br/>Generate Query Embedding]
-    G --> H[StoreManager<br/>Search ChromaDB]
-    H --> I[Retriever<br/>Filter by Threshold]
-    I --> J{Evidence Found?}
-    J -->|No| K[Return Unverifiable]
-    J -->|Yes| L[Retriever<br/>Re-rank Results]
-    L --> M[LLMClient<br/>verify_claim]
-    M --> N[Anthropic API<br/>Claude Haiku]
-    N --> O[Parse Response<br/>verdict, reasoning, confidence]
-    O --> P[Format Result]
-    P --> Q[Display in UI]
+    C --> D[Retriever<br/>search_and_rerank]
+    D --> E[Embedder<br/>Generate Query Embedding]
+    E --> F[StoreManager<br/>Search ChromaDB]
+    F --> G[Retriever<br/>Filter by Threshold<br/>Similarity >= 0.65]
+    G --> H{Evidence Found?}
+    H -->|No| I[Return Unverifiable<br/>No evidence in database]
+    H -->|Yes| J[Retriever<br/>Re-rank Results<br/>Top 3 facts]
+    J --> K[LLMClient<br/>verify_claim]
+    K --> L[Anthropic API<br/>Claude Haiku 4.5]
+    L --> M[Parse JSON Response<br/>verdict, reasoning, confidence]
+    M --> N[Normalize Verdict<br/>Based on confidence]
+    N --> O[Format Result Object]
+    O --> P[Display in UI]
     
     style A fill:#e1f5ff
-    style Q fill:#c8e6c9
-    style E fill:#ffccbc
-    style K fill:#ffccbc
+    style P fill:#c8e6c9
+    style I fill:#ffccbc
 ```
 
 ---
@@ -81,42 +79,52 @@ Detailed step-by-step flow of the claim verification process.
 
 ```mermaid
 flowchart TD
-    Start([User Submits Claim]) --> CheckVague{Is Claim Vague?<br/>Check for vague terms}
-    CheckVague -->|Yes| Unverifiable1[Return: Unverifiable<br/>Reason: Claim too vague]
-    
-    CheckVague -->|No| EmbedQuery[Embedder.embed_query<br/>Convert claim to vector<br/>Dimension: 384]
+    Start([User Submits Claim]) --> PipelineVerify[FactCheckPipeline.verify_claim<br/>Log claim]
+    PipelineVerify --> RetrieverSearch[Retriever.search_and_rerank<br/>Find relevant facts]
+    RetrieverSearch --> EmbedQuery[Embedder.embed_query<br/>Convert claim to vector<br/>Dimension: 384]
     EmbedQuery --> SearchDB[StoreManager.search<br/>Query ChromaDB<br/>Top-K: 5 results]
-    SearchDB --> FilterThreshold{Similarity >= 0.65?}
-    FilterThreshold -->|No| Unverifiable2[Return: Unverifiable<br/>Reason: No relevant evidence]
+    SearchDB --> FilterThreshold[Retriever.search<br/>Filter by threshold<br/>Similarity >= 0.65]
+    FilterThreshold --> CheckEvidence{Evidence Found?}
+    CheckEvidence -->|No| Unverifiable1[Return: Unverifiable<br/>No relevant evidence<br/>confidence: 0.0]
     
-    FilterThreshold -->|Yes| Rerank[Retriever.rerank<br/>Re-rank by relevance<br/>Top-K: 3 results]
-    Rerank --> FormatEvidence[Format Evidence<br/>Combine top 3 facts<br/>Include source & date]
-    FormatEvidence --> LLMVerify[LLMClient.verify_claim<br/>Send to Claude API]
+    CheckEvidence -->|Yes| Rerank[Retriever.rerank<br/>Re-rank by relevance<br/>LLM-based or similarity<br/>Top-K: 3 results]
+    Rerank --> FormatEvidence[Pipeline.verify_claim<br/>Format Evidence<br/>Combine top 3 facts<br/>Include source & date]
+    FormatEvidence --> LLMVerify[LLMClient.verify_claim<br/>Send to Claude API<br/>Model: claude-haiku-4-5-20251001]
     
-    LLMVerify --> LLMProcess[Claude Processes:<br/>- Claim<br/>- Evidence<br/>- Reasoning]
-    LLMProcess --> ParseResponse[Parse JSON Response:<br/>- verdict: True/False/Unverifiable<br/>- reasoning: Explanation<br/>- confidence: 0.0-1.0]
+    LLMVerify --> LLMProcess[Claude Processes:<br/>- Claim<br/>- Evidence<br/>Returns JSON]
+    LLMProcess --> ParseResponse[LLMClient.parse JSON<br/>Extract: verdict, reasoning, confidence]
     
-    ParseResponse --> NormalizeVerdict{Normalize Verdict}
-    NormalizeVerdict -->|TRUE| VerdictTrue[✅ True]
-    NormalizeVerdict -->|FALSE| VerdictFalse[❌ False]
-    NormalizeVerdict -->|Other| VerdictUnverifiable[🤷♂️ Unverifiable]
+    ParseResponse --> NormalizeVerdict{Check Verdict Type}
+    NormalizeVerdict -->|TRUE + confidence>=0.8| VerdictDT[Definitely True]
+    NormalizeVerdict -->|TRUE + confidence>=0.6| VerdictLT[Likely True]
+    NormalizeVerdict -->|TRUE + confidence<0.6| VerdictPT[Possibly True]
+    NormalizeVerdict -->|FALSE + confidence>=0.8| VerdictDF[Definitely False]
+    NormalizeVerdict -->|FALSE + confidence>=0.6| VerdictLF[Likely False]
+    NormalizeVerdict -->|FALSE + confidence<0.6| VerdictPF[Possibly False]
+    NormalizeVerdict -->|Other| VerdictUnverifiable[Unverifiable]
     
-    VerdictTrue --> FormatResult[Format Result Object]
-    VerdictFalse --> FormatResult
+    VerdictDT --> FormatResult[Format Result Object]
+    VerdictLT --> FormatResult
+    VerdictPT --> FormatResult
+    VerdictDF --> FormatResult
+    VerdictLF --> FormatResult
+    VerdictPF --> FormatResult
     VerdictUnverifiable --> FormatResult
     Unverifiable1 --> FormatResult
-    Unverifiable2 --> FormatResult
     
-    FormatResult --> ReturnResult[Return to UI:<br/>{<br/>  verdict: str,<br/>  reasoning: str,<br/>  evidence: List[str],<br/>  confidence: float<br/>}]
+    FormatResult --> ReturnResult[Return to Pipeline:<br/>{<br/>  verdict: str,<br/>  reasoning: str,<br/>  evidence: List[str],<br/>  confidence: float<br/>}]
     ReturnResult --> Display[Display in Streamlit UI]
     Display --> End([End])
     
     style Start fill:#e1f5ff
     style End fill:#c8e6c9
     style Unverifiable1 fill:#ffccbc
-    style Unverifiable2 fill:#ffccbc
-    style VerdictTrue fill:#c8e6c9
-    style VerdictFalse fill:#ffcdd2
+    style VerdictDT fill:#c8e6c9
+    style VerdictLT fill:#c8e6c9
+    style VerdictPT fill:#fff9c4
+    style VerdictDF fill:#ffcdd2
+    style VerdictLF fill:#ffcdd2
+    style VerdictPF fill:#ffccbc
     style VerdictUnverifiable fill:#fff9c4
 ```
 
@@ -260,7 +268,9 @@ graph TB
 ```python
 {
     "claim": str,
-    "verdict": "True" | "False" | "Unverifiable",
+    "verdict": "Definitely True" | "Likely True" | "Possibly True" | 
+               "Definitely False" | "Likely False" | "Possibly False" | 
+               "Unverifiable",
     "reasoning": str,
     "evidence": List[str],
     "confidence": float (0.0-1.0)
@@ -271,10 +281,17 @@ graph TB
 
 ## 🔍 Key Decision Points
 
-1. **Vague Claim Detection**: If claim contains 2+ vague terms without specific details → Return "Unverifiable"
-2. **Similarity Threshold**: If top result similarity < 0.65 → Return "Unverifiable"
-3. **Evidence Availability**: If no facts found in database → Return "Unverifiable"
-4. **LLM Verdict**: Claude analyzes claim + evidence → Returns True/False/Unverifiable
+1. **Similarity Threshold**: If top result similarity < 0.65 → Return "Unverifiable"
+2. **Evidence Availability**: If no facts found in database → Return "Unverifiable"
+3. **LLM Verdict**: Claude analyzes claim + evidence → Returns True/False/Unverifiable in JSON format
+4. **Verdict Normalization**: Based on confidence score:
+   - True + confidence >= 0.8 → "Definitely True"
+   - True + confidence >= 0.6 → "Likely True"
+   - True + confidence < 0.6 → "Possibly True"
+   - False + confidence >= 0.8 → "Definitely False"
+   - False + confidence >= 0.6 → "Likely False"
+   - False + confidence < 0.6 → "Possibly False"
+   - Other → "Unverifiable"
 
 ---
 
@@ -297,10 +314,12 @@ graph TB
 
 **To verify a claim:**
 1. User enters claim in Streamlit UI
-2. System checks if claim is vague
-3. System searches database for similar facts
-4. System sends claim + evidence to Claude
-5. System displays verdict + reasoning
+2. System generates embedding for the claim
+3. System searches database for similar facts (similarity >= 0.65)
+4. System re-ranks results and selects top 3 facts
+5. System sends claim + evidence to Claude API
+6. System parses JSON response and normalizes verdict based on confidence
+7. System displays verdict + reasoning + evidence in UI
 
 **To add new facts:**
 1. Add facts to `data/verified_facts.csv`
@@ -317,4 +336,6 @@ graph TB
 - **Threshold**: 0.65 similarity required for evidence to be considered
 - **Top-K Retrieval**: 5 facts retrieved, top 3 used for verification
 - **Batch Processing**: Facts ingested in batches of 50 for efficiency
+- **LLM Model**: Claude Haiku 4.5 (claude-haiku-4-5-20251001) - configured in `config.py`
+- **Verdict Format**: Verdicts are normalized based on confidence (Definitely/Likely/Possibly True/False)
 
